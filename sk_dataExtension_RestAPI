@@ -1,0 +1,190 @@
+public class sk_dataExtension_RestAPI {
+    
+    final static private String client_id = 'abc123';
+    final static private String client_secret = 'abc123';
+    final static private String dataExtensionEndpoint = 'abc123';
+    final static private String authEndpoint = 'abc123';
+    
+    public static void authorizeAndTrySendOrdersAgain(String ordersJSONArray)
+    {  
+        Http http = new Http();
+        HttpRequest request = new HttpRequest();
+        request.setEndpoint(authEndpoint);
+        request.setMethod('POST');
+        request.setHeader('Content-Type','application/json');
+        String body =  '{'+
+                        '"client_id" : "' + client_id +'",'+
+                        '"client_secret": "' + client_secret + '",'+
+                        '"grant_type" : "client_credentials"'+
+						'}';        request.setBody(body);
+        HttpResponse response = http.send(request);
+
+        if (response.getStatusCode() == 200) {
+            // Deserializes the JSON string into collections of primitive data types.
+            Map<String, Object> results = (Map<String, Object>) JSON.deserializeUntyped(response.getBody());
+            String token = (String) results.get('access_token');
+            Cache.Org.put('MCtoken',token);
+            sendOrderAvoidingInfinityLoop(ordersJSONArray);      
+        }else{
+            System.debug('authorizeAndTrySendOrdersAgain ' + response.getStatusCode());
+        }      
+    }
+    
+	@future(callout=true)
+    public static void sendOrder(String ordersJSONArray)
+    {  
+        String token = (String)Cache.Org.get('MCtoken');
+        Http http = new Http();
+        HttpRequest request = new HttpRequest();
+        request.setEndpoint(dataExtensionEndpoint);
+        request.setMethod('POST');
+        request.setHeader('Content-Type','application/json');
+        request.setHeader('Authorization','Bearer '+token);
+        request.setBody( ordersJSONArray );
+        //request.setBody('{"items":[{"AccountId":"8012o000002QmZkAAK","OrderId" : "8012o000002QmZkAAK","Id": "8012o000002QmZkAAZ","ProductName":"Bobby","Quantity" : "1","UnitPrice": "23456.00"}]}');
+        HttpResponse response = http.send(request);
+
+        if (response.getStatusCode() == 401) {
+			sk_dataExtension_RestAPI.authorizeAndTrySendOrdersAgain( ordersJSONArray );
+        }else if (response.getStatusCode() == 202) {
+			System.debug('sendOrder Success');
+        }else{
+            System.debug('sendOrder ' + response.getStatusCode());
+        }
+    }
+    
+    public static void sendOrderAvoidingInfinityLoop(String ordersJSONArray)
+    {  
+        String token = (String)Cache.Org.get('MCtoken');
+        Http http = new Http();
+        HttpRequest request = new HttpRequest();
+        request.setEndpoint(dataExtensionEndpoint);
+        request.setMethod('POST');
+        request.setHeader('Content-Type','application/json');
+        request.setHeader('Authorization','Bearer '+token);
+		request.setBody( ordersJSONArray );
+        HttpResponse response = http.send(request);
+        if (response.getStatusCode() == 401) {
+            System.debug('Second try, something is wrong');
+        }else if (response.getStatusCode() == 202) {
+            System.debug('sendOrderAvoidingInfinityLoop Success');
+        }  else {
+            System.debug('sendOrderAvoidingInfinityLoop ' + response.getStatusCode() );
+        }        
+    }
+    
+    public static void handleOrderRestAPI(List<SObject> newOrders){
+          
+        Map<String,String> ordersIdsAndAccountsIds = new Map<String,String>();
+        List<String> longOrderString = new List<String>();
+        Map<String,String> productsWithQuantities = new Map<String,String>();
+        
+        
+        
+        for(Order order : (List<Order>)newOrders){
+            if(order.Status == 'Activated'){
+               ordersIdsAndAccountsIds.put(order.Id,order.AccountId);
+            }     
+        }
+        
+        List<OrderItem> OrderItems    =     [SELECT Id, OrderId,
+                                                       Product2.Name,
+                                                       Quantity,
+                                                       UnitPrice 
+                                                       FROM OrderItem 
+                                                       WHERE OrderId IN :ordersIdsAndAccountsIds.keySet()];
+                /*System.debug(orderId);
+                System.debug(accountId);*/
+                for(OrderItem x : OrderItems){
+                    /*System.debug(x.Id);
+                    System.debug(x.Product2.Name);
+                    System.debug(x.Quantity);
+                    System.debug(x.UnitPrice);  */
+                    
+                    longOrderString.add( (String)x.Id );
+                    longOrderString.add( x.OrderId );
+                    longOrderString.add( ordersIdsAndAccountsIds.get(x.OrderId) );
+                    longOrderString.add( x.Product2.Name );  
+                    longOrderString.add( x.Quantity.toPlainString() );
+                    longOrderString.add( x.UnitPrice.toPlainString() );
+                    longOrderString.add ( System.now().format('yyyy/MM/dd HH:mm:ss a' ) );
+                    
+                    productsWithQuantities.put(x.Product2.Name,
+                                               x.Quantity.toPlainString()
+                                              );
+                    
+                    
+                    //System.Debug( System.now().format('yyyy/MM/dd HH:mm:ss a' ) );
+                    //
+                                    
+                }
+            
+        
+        if(! productsWithQuantities.isEmpty() ){
+            List<Product2> productsToUpsertSoldQuantity = [SELECT ID,Name,SoldQuantity__c 
+                                                           FROM Product2 
+                                                           WHERE Name IN :productsWithQuantities.keySet()];
+			        
+            for(Product2 product : productsToUpsertSoldQuantity){
+                if( product.SoldQuantity__c == null){
+                    product.SoldQuantity__c = decimal.valueOf( productsWithQuantities.get(product.Name) );
+                }else {
+                     product.SoldQuantity__c += decimal.valueOf( productsWithQuantities.get(product.Name) );
+                }
+            }
+            
+            upsert productsToUpsertSoldQuantity;
+        }
+    
+    if(! longOrderString.isEmpty() ){
+        sk_dataExtension_RestAPI.sendOrder( parseLongOrderStringToJsonForm(longOrderString) );
+    }
+    }
+    
+     public static String parseLongOrderStringToJsonForm(List<String> longOrderString){
+        //request.setBody('{"items":[{"AccountId":"8012o000002QmZkAAK","OrderId" : "8012o000002QmZkAAK","Id": "8012o000002QmZkAAS","ProductName":"Bobby","Quantity" : "1","UnitPrice": "23456.00"}]}');
+        //
+        String body =   '{' +
+            		   			 '"items":[';  
+        Integer i = 1;
+        for(String s : longOrderString){
+            
+            switch on i {
+                when 1{
+                   body += '{"Id" : "'+s+'",';  
+                }
+                when 2{
+                    body += '"OrderId" : "'+s+'",';   
+                }
+                when 3{
+					body += '"AccountId" : "'+s+'",';                    
+                }
+                when 4{
+                    body += '"ProductName" : "'+s+'",';
+                }
+                when 5{
+                    body += '"Quantity" : "'+s.substringBeforeLast('.')+'",';
+                }
+                when 6{
+                    body += '"UnitPrice" : "'+s+'",';
+                }
+                when 7{
+                    body += '"Date" : "'+s+'"},';
+                }
+            }
+ 
+            if(i==7){
+                i=1;
+            }else {
+                i++;
+            }
+        }
+         
+        body = body.substringBeforeLast(',');
+        body += ']}';
+        return body;  
+    }
+ 
+    //below example of how body of this request should look like
+   //request.setBody('{"items":[{"AccountId":"8012o000002QmZkAAK","OrderId" : "8012o000002QmZkAAK","Id": "8012o000002QmZkAAS","ProductName":"Bobby","Quantity" : "1","UnitPrice": "23456.00"}]}');
+ }
